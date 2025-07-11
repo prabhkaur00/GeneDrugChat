@@ -13,7 +13,7 @@ def train_model(
     train_dataset,
     val_dataset,
     tokenizer,
-    batch_size=1,
+    batch_size=4,
     num_epochs=20,
     learning_rate=5e-7,
     warmup_ratio=0.1,
@@ -22,11 +22,17 @@ def train_model(
     max_len=25,
     log_predictions=True,
     log_frequency=10,
-    stage_name="",                     # NEW: name of HDF5 stage for checkpoint naming
-    checkpoint_interval=100            # NEW: save checkpoint every N batches
+    stage_name="",
+    checkpoint_interval=100
 ):
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"[Trainable] {name}: {param.numel()}")
+
     log_file = f"training_loss_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     log_path = os.path.join("logs", log_file)
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("checkpoints", exist_ok=True)
     with open(log_path, "w") as f:
         f.write("step,epoch,batch,loss\n")
 
@@ -56,11 +62,13 @@ def train_model(
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     for epoch in range(num_epochs):
-        print(f"[Epoch {epoch+1}] Starting")
+        print(f"\n[Epoch {epoch+1}] Starting")
         print_gpu_memory()
         total_loss = 0.0
         step_count = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        loss_print_interval = max(len(train_loader) // 10, 1)  # ~10x per epoch
+        prediction_log_interval = max(len(train_loader) // 5, 1)  # ~5x per epoch
 
         for batch_idx, batch in enumerate(pbar):
             try:
@@ -80,27 +88,32 @@ def train_model(
                     optimizer.step()
                     optimizer.zero_grad()
                     scheduler.step()
-                    avg_loss = total_loss / step_count
+
+                    avg_loss = total_loss / step_count if step_count > 0 else 0
                     with open(log_path, "a") as f:
                         f.write(f"{step_count},{epoch+1},{batch_idx+1},{avg_loss:.4f}\n")
-                    pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
 
                 total_loss += loss.item() * grad_accum_steps
                 step_count += 1
 
-                if batch_idx % (len(train_loader) // 10) == 0:
+                # Minimal console loss printing
+                if batch_idx % loss_print_interval == 0 and step_count > 0:
                     avg_loss = total_loss / step_count
                     pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
+                    print(f"[Epoch {epoch+1} | Batch {batch_idx}] Loss: {avg_loss:.4f}")
 
-                if log_predictions and batch_idx % log_frequency == 0:
+                # Periodically log qualitative predictions
+                if log_predictions and batch_idx % prediction_log_interval == 0:
                     model.eval()
-                    log_batch_predictions(model, batch, tokenizer, device, batch_idx, epoch)
+                    try:
+                        log_batch_predictions(model, batch, tokenizer, device, batch_idx, epoch)
+                    except Exception as e:
+                        print(f"[Prediction log error] {e}")
                     model.train()
 
                 if batch_idx % (len(train_loader) // 5) == 0:
                     torch.cuda.empty_cache()
 
-                # NEW: save checkpoint every N batches
                 if (batch_idx + 1) % checkpoint_interval == 0:
                     ckpt_path = f"checkpoints/ckpt_epoch{epoch}_step{step_count}_{stage_name}_batch{batch_idx + 1}.pt"
                     torch.save({
@@ -110,7 +123,7 @@ def train_model(
                         'epoch': epoch,
                         'step': step_count
                     }, ckpt_path)
-                    print(f"Checkpoint saved: {ckpt_path}")
+                    print(f"[Checkpoint saved] {ckpt_path}")
 
             except RuntimeError as e:
                 if "out of memory" in str(e) or "device-side assert" in str(e):
@@ -120,10 +133,9 @@ def train_model(
                     raise e
 
         avg_epoch_loss = total_loss / step_count if step_count > 0 else 0
-        print(f"Epoch {epoch+1} finished. Avg loss: {avg_epoch_loss:.4f}")
+        print(f"[Epoch {epoch+1}] Finished. Avg loss: {avg_epoch_loss:.4f}")
         torch.cuda.empty_cache()
 
-        # Save final checkpoint at the end of the epoch
         final_ckpt = f"checkpoints/ckpt_epoch{epoch}_final_{stage_name}.pt"
         torch.save({
             'model_state_dict': model.state_dict(),
@@ -132,6 +144,6 @@ def train_model(
             'epoch': epoch,
             'step': step_count
         }, final_ckpt)
-        print(f"Final checkpoint saved: {final_ckpt}")
+        print(f"[Checkpoint saved] {final_ckpt}")
 
     return model
